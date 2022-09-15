@@ -1,0 +1,561 @@
+---
+title: "R Notebook"
+output:
+  word_document: default
+  html_notebook: default
+  pdf_document: default
+---
+
+# PROJECT
+The file Elec-train.xlsx contains electricity consumption (kW) and outdoor air temperature for one building.
+These quantities are measured every 15 minutes, from 1/1/2010 1:15 to 2/17/2010 23:45. In addition, outdoor air temperature are available for 2/18/2010. 
+
+# GOAL
+The goal is to forecast electricity consumption (kW) for 2/18/2010.
+
+Two forecasts should be returned, in one Excel file entitled YourName.xlsx, with exactly two columns (one columns per forecast) and 96 rows:
+PART 1. the first one without using outdoor temperature,
+PART 2. the second one using outdoor temperature.
+Of course, the goal is to get the best possible forecasting. 
+
+```{r}
+install.packages("Rcpp", dependencies = TRUE)
+install.packages("fpp", dependencies=TRUE)
+install.packages("forecast", dependencies = TRUE)
+library(readxl)
+```
+
+```{r}
+install.packages("vars", dependencies = TRUE)
+```
+
+
+
+```{r}
+library(fpp)
+library(ggplot2) 
+library(forecast)
+library(xts)
+library(urca)
+library(vars)
+```
+
+
+# Preparation of the dataset
+```{r}
+##Preparation of the dataset (Obs: The three first lines have issue into the format of the "Time" column)
+data <- read_excel("C:\\Users\\Hanna\\Downloads\\Elec-train.xlsx", range = cell_rows(3:4700), col_names = c("Time", "Power", "Temp"), col_types = c("text", "numeric", "numeric"))
+```
+
+
+```{r}
+dat <- na.omit(data)
+summary (dat$Power)
+head(dat)
+```
+
+```{r}
+##transform the data into a XTS timeseries
+dat_power_xts <- xts(dat$Power, order.by = as.POSIXct(dat$Time, format='%m/%d/%Y %H:%M'))
+head(dat_power_xts)
+```
+
+```{r}
+#To work now, let's convert XTS to TS format using the period of 96 found (see later).
+dat_power_ts = ts(as.numeric(dat_power_xts),freq=96)
+```
+
+# PART 1:  forecasting of electricity consumption for 2/18/2010 without taking into account the outdoor temperature
+
+## I. Plot the data, identify unusual observations and understand patterns
+```{r}
+##let's plot the data to see whether we can see some trend or seasonal pattern
+autoplot(dat_power_ts) + ggtitle('Electricity Power')+ xlab('Time')+ylab('Electricity Power')
+```
+Conclusion: 
+Series can be stationary, trended or seasonal. Our time plot 1) is not stationary, 2) shows a seasonal pattern 3) but does not show any trend. 
+We tested here, whether the frequency of the pattern corresponds to one day (i.e: 4*24hours = 96)
+
+```{r}
+ggseasonplot(dat_power_ts)
+```
+Conclusion: The seasonal graph allows to see that the seasonality is equal to 96 (which actually corresponds to 24hrs)
+
+
+
+To verify the observations, let's looking at autocorrelation function plots (ACF)
+
+```{r}
+ggtsdisplay(dat_power_ts, lag=96)
+```
+Conclusion: The correlogram does not show stationary data as the ACF does not drop quickly to zero. So, forecasting can be done. Moreover, ACF shows a clear seasonal pattern. 
+
+
+## II. If necessary, use a Box-Cox transformation to stabilize the variance
+
+No evidence of changing variance, so no Box-Cox transformation.
+
+## III. If necessary, difference the data until it appears stationary. 
+
+
+As a stationarized series is relatively easy to predict: let see if by differencing the timeseries, we could obtain a stationarized timeseries.
+
+Fist, we are going to determine if the seasonal difference (lag=96) may lead to stationarization of the timeseries.
+
+```{r}
+ggtsdisplay(diff(dat_power_ts,lag=96))
+```
+
+```{r}
+Box.test(diff(dat_power_ts,lag=96,differences=1),lag=96, type="Ljung-Box")
+```
+
+```{r}
+summary(ur.kpss(diff(dat_power_ts,lag=96), type="mu"))
+```
+Conclusion: Those tests allow to conclude that the seasonal difference is not sufficient to obtain a stationary timeseries
+
+We are goint to check for the trend difference:
+
+```{r}
+ggtsdisplay(diff(diff(dat_power_ts,lag=96)))
+```
+
+```{r}
+summary(ur.kpss(diff(diff(dat_power_ts,lag=96), type="mu")))
+```
+
+Conclusion: Kwiatkowski-Phillips-Schmidt-Shin (KPSS) test confirms that the diff(diff(data_power_ts)) is stationary. 
+(plus la statistique de test est grande, plus on s’éloigne de la stationnarité (hypothèse nulle))
+ 
+This diff(diff(dat_power_ts)) willbe usefull to predict ARIMA model parameters 
+
+## IV.Plot again the ACF/PACF and try to determine possible candidate models.
+
+```{r}
+dat_power_ts_train = head(dat_power_ts, n=3648, freq=96)
+dat_power_ts_test = tail(dat_power_ts, n=954, freq=96)
+frequency(dat_power_ts_test)
+frequency(dat_power_ts_train)
+```
+
+```{r}
+##Plot the data to predict (test and the forecast for the 2010-02-18)
+autoplot(dat_power_ts_train,series="train set")+ autolayer(dat_power_ts_test,series="data to predict")+ ggtitle('Electricity Power')+ xlab('Time')+ ylab('Electricity Power')
+```
+#    a. HoltWinters method
+
+Let's start the prediction with the HoltWinters method.
+
+```{r}
+fit_power_train_hw=HoltWinters(dat_power_ts_train,alpha=NULL, beta=NULL, gamma=NULL) 
+prev_power_hw <- predict(fit_power_train_hw, n.ahead=956)
+```
+
+We can zoom on the prediction
+
+```{r}
+plot(dat_power_ts_train,xlim=c(39,50),ylim=c(100,350))
+lines(dat_power_ts_test,lty=2, col=4)
+lines(prev_power_hw,col=2)
+legend('topleft',col=1:2,lty=1,legend=c('true','forecast with HW'))
+```
+
+```{r}
+print(sqrt(mean((prev_power_hw - dat_power_ts_test)^2)))
+```
+
+
+###    b. SARIMA method : ARIMA(p,d,q)(P,D,Q)m
+
+    -Automated Arima
+
+First, let's run the auto.arima to have an idea of the parameters we should choose.
+
+```{r}
+Sar_auto=auto.arima(dat_power_ts_train, seasonal=TRUE)
+prev_power_sar_auto=forecast(Sar_auto,h=954)
+```
+
+
+```{r}
+summary(prev_power_sar_auto)
+```
+
+```{r}
+plot(dat_power_ts_train, xlim=c(39,50))
+lines(dat_power_ts_test,col=4)
+lines(prev_power_sar_auto$mean,col=2)
+```
+
+```{r}
+print(sqrt(mean((prev_power_sar_auto$mean - dat_power_ts_test)^2)))
+```
+The forecast is not better than HW. In fact, RMSE is bigger for the automatic_Sarima prediction than for HW prediction.
+We can try to choose manually the order of the SARIMA model.
+
+    -Manually Arima model
+
+To determine the parameters of the SARIMA, we looked at the autocorrelation of diff(diff(dat_power_ts, lag=96)) as we have shown above that this time series is stationary.
+
+```{r}
+ggAcf(diff(diff(dat_power_ts, lag=96)))
+ggPacf(diff(diff(dat_power_ts, lag=96)))
+```
+
+ARIMA automatic gives the following values: ARIMA(1,0,0)(0,1,0)[96]
+
+SARIMA(p,d,q)x(P,D,Q)s
+
+For ARIMA (P,D,Q) we only look at the lag=96, lag=192, etc.
+d and seasonal D indicate difference that must be done to have a stationary series: here 1 for first difference and 1 for seasonal difference >> so D=1 and d=1
+q and Q indicate number of moving average terms (lags of the forecast errors): first significant negative spikes >> q=1 and Q=1
+p and P indicate number of autoregressive terms (lags of the stationary serie): first significant positive spikes >> p=1 and P=0
+
+So this gives our first model of SARIMA: ARIMA(0,1,1)(0,1,1)[96]
+```{r}
+fit1=Arima(dat_power_ts_train, order=c(0,1,1), seasonal=c(0,1,1))
+ggAcf(residuals(fit1))
+ggPacf(residuals(fit1))
+```
+ACF of Fit1 still gives some autocorrelation at lag3 (negative spike).
+So let's try a new model:  SARIMA(0,1,3)(0,1,1)96 and SARIMA(3,1,0)(0,1,1)96
+
+```{r}
+fit2=Arima(dat_power_ts_train, order=c(0,1,3), seasonal=c(0,1,1))
+```
+
+
+```{r}
+ggAcf(residuals(fit2))
+ggPacf(residuals(fit2))
+```
+
+```{r}
+fit2b=Arima(dat_power_ts_train, order=c(3,1,0), seasonal=c(0,1,1))
+```
+
+
+```{r}
+ggAcf(residuals(fit2b))
+ggPacf(residuals(fit2b))
+```
+ACF of Fit2 and Fit2b still gives some autocorrelation at lag4 (negative spike).
+So let's try a new model:  SARIMA(3,1,4)(0,1,1)96
+
+```{r}
+fit3=Arima(dat_power_ts_train, order=c(3,1,4), seasonal=c(0,1,1))
+```
+
+
+```{r}
+ggAcf(residuals(fit3))
+ggPacf(residuals(fit3))
+```
+Let's try a new model:  SARIMA(4,1,0)(0,1,1)96 as we have a negative pick at lag4
+
+```{r}
+fit4=Arima(dat_power_ts_train, order=c(4,1,0), seasonal=c(0,1,1))
+```
+
+
+```{r}
+ggAcf(residuals(fit4))
+ggPacf(residuals(fit4))
+```
+
+
+```{r}
+RMSE_fit1=print(sqrt(mean(((forecast(fit1,h=956))$mean - dat_power_ts_test)^2)))
+RMSE_fit2=print(sqrt(mean(((forecast(fit2,h=956))$mean - dat_power_ts_test)^2)))
+RMSE_fit2b=print(sqrt(mean(((forecast(fit2b,h=956))$mean - dat_power_ts_test)^2)))
+RMSE_fit3=print(sqrt(mean(((forecast(fit3,h=956))$mean - dat_power_ts_test)^2)))
+RMSE_fit4=print(sqrt(mean(((forecast(fit4,h=956))$mean - dat_power_ts_test)^2)))
+```
+Thus the best model of SARIMA is fit2b. Let's plot the predictions for the test dataset
+```{r}
+prev_fit2b=forecast(fit2b,h=956)
+```
+
+```{r}
+plot(dat_power_ts_train, xlim=c(39,50))
+lines(dat_power_ts_test,col=3)
+lines(prev_fit2b$mean,col=2)
+```
+
+###    c. Forecasting with Neural Network
+
+    -Automated Neural Network
+    
+```{r}
+fit1_nntart=nnetar(dat_power_ts_train,T=96)
+```
+
+
+```{r}
+print(fit1_nntart)
+```
+
+```{r}
+prevNN1=forecast(fit1_nntart,h=956)
+```
+
+```{r}
+print(sqrt(mean((prevNN1$mean - dat_power_ts_test)^2)))
+```
+
+```{r}
+plot(dat_power_ts_train, xlim=c(39,50))
+lines(dat_power_ts_test,col=3)
+lines(prevNN1$mean,col=2)
+```
+Conclusion: prediction is very bad for the automated NN model.
+
+###    d. Conclusion
+
+The best model is fit2b SARIMA(3,1,0)(0,1,1)96 with a RMSE of 13.70
+Let's plot the forecast of all the models to have a better idea.
+
+```{r}
+plot(dat_power_ts_train,xlim=c(39,49),ylim=c(100,350))
+lines(dat_power_ts_test,lty=2, col=2)
+lines(prev_power_hw,col=3)
+lines(prev_power_sar_auto$mean,col=4)
+lines(prev_fit2b$mean,col=5)
+lines(prevNN1$mean, col=6)
+legend('topleft',col=1:6,lty=1,legend=c('true','HW','auto Arema','Arema', 'NN' ))
+```
+    
+   
+## VI. Check the residuals from my chosen model fit2b by plotting the ACF of the residuals
+
+
+```{r}
+checkresiduals(fit2b)
+```
+The residual are not white noise, but I could not find a better model for our forecast. 
+
+
+```{r}
+cat('AICc for SARIMA(3,1,0)(0,1,1)96 : ',fit2b$aicc,'\n')
+```
+
+
+Do the residuals look like white noise?
+
+```{r}
+res <- residuals(fit2b)
+
+Box.test(res,lag=96, type="Ljung-Box")
+```
+Conclusion: 
+Meaning Box-Ljung test: if there are lags where the p-value exceeds 0.05, meaning that we fail to reject the null hypothesis, with the null hypothesis being that the prediction error represents white noise.
+p-value is very low, residuals are not white noise. We should continue to find a better model.
+
+## VII. Conclusion Part1 project: Calculate forecasts
+
+The best model is ARIMA(3,1,0)(0,1,1) 
+
+# PART 2:  Forecasting of electricity consumption for 2/18/2010 by taking into account the outdoor temperature
+
+## I. Data preparation/visualization
+We will use a dynamic regression model for forecasting electricity power, using temperature as external covariate. The order of the ARIMA model for the residual part is automatically selected
+
+```{r}
+##transform the data into a XTS timeseries
+dat_Temp_xts <- xts(data$Temp, order.by = as.POSIXct(data$Time, format='%m/%d/%Y %H:%M'))
+head(dat_Temp_xts)
+```
+
+```{r}
+dat_Temp_ts = ts(as.numeric(dat_Temp_xts),freq=96)
+head(dat_Temp_ts)
+plot(dat_Temp_ts, col=2)
+```
+
+```{r}
+dat_Temp <-  head(dat_Temp_ts, n=4602, freq=96)
+
+dat_Temp_ts_train = head(dat_Temp, n=3648, freq=96)
+
+dat_Temp_ts_test = tail(dat_Temp, n=954, freq=96)
+```
+
+
+```{r}
+head(dat_Temp_ts_train)
+head(dat_Temp_ts_test)
+```
+
+
+```{r}
+##let's plot the data to see whether we can see some trend or seasonal pattern
+plot(dat_power_ts,xlim=c(0,50),ylim=c(0,350))
+lines(dat_Temp,lty=2, col=2)
+legend('topleft',col=1:2,lty=1,legend=c('power','temp'))
+```
+
+##II. Time series Regression Model
+
+```{r}
+MLR=tslm(formula = dat_power_ts_train~dat_Temp_ts_train+trend+season)
+```
+
+
+```{r}
+summary(MLR)
+```
+All the features seems significant.
+
+```{r}
+ggAcf(residuals(MLR))
+ggPacf(residuals(MLR))
+```
+
+##III. Dynamic Regression Model
+
+```{r}
+fit_Pro2=auto.arima(dat_power_ts_train,xreg=dat_Temp_ts_train)
+```
+
+```{r}
+prev_Pro2=forecast(fit_Pro2,h=954,xreg=dat_Temp_ts_test)
+```
+
+
+```{r}
+autoplot(dat_power_ts_test)+autolayer(prev_Pro2$mean)+autolayer(dat_Temp_ts_test)
+```
+
+
+```{r}
+print(sqrt(mean((prev_Pro2$mean - dat_power_ts_test)^2)))
+```
+
+```{r}
+summary(fit_Pro2)
+```
+
+
+```{r}
+ggAcf(residuals(fit_Pro2))
+ggPacf(residuals(fit_Pro2))
+```
+Conclusion: the model proposed is ARIMA(1,0,0)(0,1,0)[96], however, we can still observe some auto correlations.
+
+We can try to find a better model manually. Let’s have a look to the relationship between Power and Temperature.
+
+Let's try
+ARIMA(1,1,4)(0,1,2)
+
+
+```{r}
+fit_Pro3=Arima(dat_power_ts_train, order=c(1,1,4), xreg=dat_Temp_ts_train, seasonal=c(0,1,2))
+```
+
+```{r}
+checkresiduals(fit_Pro3)
+```
+
+
+```{r}
+ggAcf(residuals(fit_Pro3))
+ggPacf(residuals(fit_Pro3))
+```
+
+```{r}
+fit_Pro4=Arima(dat_power_ts_train, order=c(5,1,4), xreg=dat_Temp_ts_train, seasonal=c(0,1,2))
+
+```
+
+
+```{r}
+ggAcf(residuals(fit_Pro4))
+ggPacf(residuals(fit_Pro4))
+```
+
+```{r}
+#fit_Pro5=Arima(dat_power_ts_train, order=c(11,1,5), xreg=dat_Temp_ts_train, seasonal=c(0,1,2))
+```
+
+
+```{r}
+#ggAcf(residuals(fit_Pro5))
+#ggPacf(residuals(fit_Pro5))
+```
+
+
+
+```{r}
+RMSE_fit_Pro2=print(sqrt(mean(((forecast(fit_Pro2,h=954,xreg=dat_Temp_ts_test))$mean - dat_power_ts_test)^2)))
+RMSE_fit_Pro3=print(sqrt(mean(((forecast(fit_Pro3,h=954,xreg=dat_Temp_ts_test))$mean - dat_power_ts_test)^2)))
+RMSE_fit_Pro4=print(sqrt(mean(((forecast(fit_Pro4,h=954,xreg=dat_Temp_ts_test))$mean - dat_power_ts_test)^2)))
+#RMSE_fit_Pro5=print(sqrt(mean(((forecast(fit_Pro5,h=954,xreg=dat_Temp_ts_test))$mean - dat_power_ts_test)^2)))
+
+```
+
+
+Finally, we can compare with a NNAR model with covariates.
+
+```{r}
+fit_NN_Pro=nnetar(dat_power_ts_train,xreg=dat_Temp_ts_train)
+prev_NN_Pro=forecast(fit_NN_Pro,h=964,xreg=dat_Temp_ts_test)
+```
+
+
+```{r}
+autoplot(dat_power_ts_test)+autolayer(prev_NN_Pro$mean,series="NNAR using Temperature")
+
+```
+
+```{r}
+RMSE_fit_NN_Pro=print(sqrt(mean(((forecast(fit_NN_Pro,h=954,xreg=dat_Temp_ts_test))$mean - dat_power_ts_test)^2)))
+```
+
+## IV. Conclusion Part2 project: Calculate forecasts
+The goal of this second part of the project was to perform a forecast of electricity consumption for 2/18/2010 by taking into account the outdoor temperature. Here the best model (with lower RMSE is fit_Pro4) i.e. ARIMA(5,1,4)(0,1,2)96.
+
+```{r}
+prev_Pro4=forecast(fit_Pro4,h=954,xreg=dat_Temp_ts_test)
+```
+
+
+```{r}
+autoplot(dat_power_ts_test)+autolayer(prev_Pro4$mean)
+```
+
+
+# MAIN CONCLUSION
+The goal of this project was to forecast electricity consumption for 2/18/2010. Here we observed that this forecast is better without taking into account the outdoor temperature. More specifically, we found that the best one is SARIMA(3,1,0)(0,1,1)96 with a RMSE of 13.70.
+
+## Forecast from Part1_ Without taking into account outdoor temperature
+```{r}
+prev_without_temp_final=forecast(fit2b,h=96)
+```
+## Forecast from Part2_ With taking into account outdoor temperature
+
+```{r}
+dat_Temp_prev = tail(dat_Temp_ts, n=96, freq=96)
+
+```
+
+
+```{r}
+prev_with_temp_final=forecast(fit_Pro4,xreg=dat_Temp_prev,h=96)
+```
+
+```{r}
+x <- data.frame(prev_without_temp_final$mean, prev_with_temp_final$mean)
+```
+
+```{r}
+  plot(prev_without_temp_final$mean, col="2")
+  lines(prev_with_temp_final$mean, col="3")
+```
+
+
+```{r}
+write.csv(x, file ="PaulineSalis.csv", col.names=c("Forecast Without Temperature","Forecast With Temperature"))
+```
+
+
